@@ -21,6 +21,9 @@ static void freeproc(struct proc *p);
 
 extern char trampoline[]; // trampoline.S
 
+extern pagetable_t kernel_pagetable;
+extern char etext[];
+
 // initialize the proc table at boot time.
 void
 procinit(void)
@@ -121,6 +124,21 @@ found:
     return 0;
   }
 
+  // An empty kernel page table
+  p->k_pagetable = proc_kpt_init();
+  if (p->k_pagetable == 0) {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  // allocate a page for the process's kernel stack
+  pte_t* pte = walk(kernel_pagetable, p->kstack, 0);
+  uint64 pa = PTE2PA(*pte); 
+  if(pa == 0)
+    panic("walkaddr");
+  uvmmap(p->k_pagetable, p->kstack, pa, PGSIZE, PTE_R | PTE_W);
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -141,6 +159,8 @@ freeproc(struct proc *p)
   p->trapframe = 0;
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
+  if (p->k_pagetable)
+    proc_freekpagetable(p);
   p->pagetable = 0;
   p->sz = 0;
   p->pid = 0;
@@ -193,6 +213,19 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
   uvmunmap(pagetable, TRAPFRAME, 1, 0);
   uvmfree(pagetable, sz);
+}
+
+void proc_freekpagetable(struct proc* p) {
+  pagetable_t kpagetable = p->k_pagetable;
+  ukvmunmap(kpagetable, UART0, PGSIZE);
+  ukvmunmap(kpagetable, VIRTIO0, PGSIZE);
+  ukvmunmap(kpagetable, CLINT, 0x10000);
+  ukvmunmap(kpagetable, PLIC, 0x400000);
+  ukvmunmap(kpagetable, KERNBASE, (uint64)etext-KERNBASE);
+  ukvmunmap(kpagetable,(uint64)etext, PHYSTOP - (uint64)etext);
+  ukvmunmap(kpagetable, TRAMPOLINE, PGSIZE);
+  ukvmunmap(kpagetable, p->kstack, PGSIZE);
+  freewalk(kpagetable);
 }
 
 // a user program that calls exec("/init")
@@ -473,6 +506,10 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+
+        w_satp(MAKE_SATP(p->k_pagetable));
+        sfence_vma();
+
         swtch(&c->context, &p->context);
 
         // Process is done running for now.
@@ -485,6 +522,8 @@ scheduler(void)
     }
 #if !defined (LAB_FS)
     if(found == 0) {
+      w_satp(MAKE_SATP(kernel_pagetable));
+      sfence_vma();
       intr_on();
       asm volatile("wfi");
     }
