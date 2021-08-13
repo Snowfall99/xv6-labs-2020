@@ -16,6 +16,30 @@
 #include "file.h"
 #include "fcntl.h"
 
+struct inode* getip(char *path, uint depth, int omode) {
+  if (depth > SYMLINK_MAX_DEPTH) {
+    return 0;
+  }
+
+  struct inode *ip;
+  if ((ip = namei(path)) == 0) {
+    return 0;
+  }
+
+  ilock(ip);
+  if (!(omode & O_NOFOLLOW) && ip->type == T_SYMLINK) {
+    char next[MAXPATH];
+    if (readi(ip, 0, (uint64)next, ip->size - MAXPATH, MAXPATH) == 0) {
+      iunlock(ip);
+      return 0;
+    }
+    iunlock(ip);
+    return getip(next, depth + 1, omode);
+  }
+  iunlock(ip);
+  return ip;
+}
+
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
 static int
@@ -304,7 +328,7 @@ sys_open(void)
       return -1;
     }
   } else {
-    if((ip = namei(path)) == 0){
+    if((ip = getip(path, 0, omode)) == 0){
       end_op();
       return -1;
     }
@@ -483,4 +507,46 @@ sys_pipe(void)
     return -1;
   }
   return 0;
+}
+
+uint64 sys_symlink(void) {
+  char name[DIRSIZ], target[MAXPATH], path[MAXPATH];
+  struct inode *dp, *ip;
+
+  if (argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
+    return -1;
+  
+  begin_op();
+  if ((ip = namei(target)) != 0 && ip->type != T_DIR) {
+    ilock(ip);
+    ip->nlink++;
+    iupdate(ip);
+    iunlockput(ip);
+  }
+
+  if ((dp = namei(path)) == 0) {
+    if ((dp = nameiparent(path, name)) == 0) {
+      printf("NO inode corresponding to path's parent\n");
+      goto bad;
+    } else {
+      if ((dp = create(path, T_SYMLINK, 0, 0)) == 0) {
+        printf("create symlink for path fail\n");
+        goto bad;
+      } else {
+        iunlock(dp);
+      }
+    }
+  }
+
+  ilock(dp);
+  writei(dp, 0, (uint64)target, dp->size, MAXPATH);
+
+  dp->type = T_SYMLINK;
+  iunlockput(dp);
+  end_op();
+  return 0;
+
+bad:
+  end_op();
+  return -1;
 }
